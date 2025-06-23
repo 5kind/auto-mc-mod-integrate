@@ -1,0 +1,199 @@
+name: Update Mods and Release
+
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+  
+  # Runs on a schedule (every Sunday at 05:00 UTC)
+  schedule:
+    - cron: '0 5 * * 0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Needed to create releases and commit files
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+            # Fetch all history for all tags and branches
+            fetch-depth: 0
+
+      - name: Setup environment
+        run: |
+          # Create directories for downloads and packaging
+          mkdir -p mods_temp
+          mkdir -p resourcepacks_temp
+          # This file will track the versions of the last successful build
+          touch versions.lock
+
+      - name: Download Mods and Check for Updates
+        id: download_mods
+        run: |
+          # --- Script Start ---
+          # Set a User-Agent for API calls, which is a good practice.
+          USER_AGENT="GitHub-CI-Modpack-Updater/1.0 (Repo: ${{ github.repository }})"
+          # Flag to check if any file has been updated.
+          UPDATE_FOUND=false
+          # Flag to mark if a pre-release version was used.
+          IS_PRE_RELEASE=false
+          # File to store current version details
+          NEW_VERSIONS_LOG="versions.new.log"
+          # File to store previous version details from last commit
+          OLD_VERSIONS_LOG="versions.lock"
+
+          echo "Fetching latest Minecraft version..."
+          # Get the latest "release" version of Minecraft from Modrinth API
+          MC_VERSION=$(curl -s -H "User-Agent: $USER_AGENT" 'https://api.modrinth.com/v2/tag/game_version' | jq -r '.[] | select(.version_type == "release") | .version' | head -n 1)
+          if [ -z "$MC_VERSION" ]; then
+            echo "::error::Could not determine latest Minecraft version."
+            exit 1
+          fi
+          echo "Latest Minecraft version is $MC_VERSION"
+
+          # Get the version details from the last commit if the lock file exists
+          if [[ -f "$OLD_VERSIONS_LOG" ]]; then
+            echo "Found existing versions.lock file."
+          else
+            echo "No versions.lock file found, this must be the first run."
+            # Create an empty file to prevent errors
+            touch "$OLD_VERSIONS_LOG"
+          fi
+          
+          # Process the modrinth.txt file
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            # Skip empty lines or comments
+            if [[ -z "$line" ]] || [[ "$line" == \#* ]]; then
+              continue
+            fi
+            
+            TYPE=$(echo $line | cut -d'/' -f1)
+            SLUG=$(echo $line | cut -d'/' -f2)
+            
+            echo "--- Processing $TYPE: $SLUG ---"
+            
+            # First, try to get a "release" version
+            API_URL="https://api.modrinth.com/v2/project/$SLUG/version?loaders=[\"fabric\"]&game_versions=[\"$MC_VERSION\"]&featured=true"
+            VERSION_DATA=$(curl -s -H "User-Agent: $USER_AGENT" "$API_URL" | jq '.[0]')
+            
+            # If no release version, try to get beta or alpha
+            if [ "$(echo $VERSION_DATA | jq -r '.id')" == "null" ]; then
+              echo "No release version found. Searching for pre-releases (beta/alpha)..."
+              API_URL="https://api.modrinth.com/v2/project/$SLUG/version?loaders=[\"fabric\"]&game_versions=[\"$MC_VERSION\"]"
+              VERSION_DATA=$(curl -s -H "User-Agent: $USER_AGENT" "$API_URL" | jq '.[0]')
+              IS_PRE_RELEASE=true
+            fi
+
+            # Check if any version was found
+            if [ "$(echo $VERSION_DATA | jq -r '.id')" == "null" ]; then
+              echo "::warning::Could not find a compatible version for $SLUG on Minecraft $MC_VERSION."
+              continue
+            fi
+            
+            FILE_DATA=$(echo $VERSION_DATA | jq '.files[0]')
+            FILENAME=$(echo $FILE_DATA | jq -r '.filename')
+            FILE_URL=$(echo $FILE_DATA | jq -r '.url')
+            SHA512_HASH=$(echo $FILE_DATA | jq -r '.hashes.sha512')
+
+            echo "Found version: $(echo $VERSION_DATA | jq -r '.name') ($FILENAME)"
+            
+            # Compare with the old version hash
+            OLD_HASH=$(grep "^$SLUG:" "$OLD_VERSIONS_LOG" | cut -d':' -f2)
+
+            if [ "$SHA512_HASH" != "$OLD_HASH" ]; then
+              echo "New version detected for $SLUG. (New hash: ${SHA512_HASH:0:10}..., Old hash: ${OLD_HASH:0:10}...)"
+              UPDATE_FOUND=true
+            else
+              echo "No change detected for $SLUG."
+            fi
+
+            # Always log the new version details for the next run
+            echo "$SLUG:$SHA512_HASH" >> "$NEW_VERSIONS_LOG"
+
+            # Download the file
+            DOWNLOAD_PATH="./${TYPE}s_temp/$FILENAME"
+            echo "Downloading to $DOWNLOAD_PATH"
+            curl -s -L -o "$DOWNLOAD_PATH" "$FILE_URL"
+
+          done < modrinth.txt
+
+          # If no updates were found, exit gracefully
+          if [ "$UPDATE_FOUND" = false ]; then
+            echo "No mod updates found. Exiting."
+            echo "needs_release=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Updates found. Proceeding to package and release."
+          
+          # --- Generate Release Tag ---
+          # Format: <mc_version>-<year>w<week><build>
+          # Example: 1.21-25w34a
+          YEAR_WEEK=$(date +%y"w"%V)
+          
+          # To handle 'a', 'b', 'c', we check if a tag for this week already exists.
+          # This is a simple implementation, starting with 'a' and incrementing.
+          # For a more robust solution, you might query GitHub's API for existing tags.
+          BASE_TAG="$MC_VERSION-$YEAR_WEEK"
+          
+          # Simple check for existing tags to increment build letter
+          # NOTE: This relies on `git` being able to see remote tags. `checkout` action fetches them.
+          LATEST_TAG_FOR_WEEK=$(git tag -l "$BASE_TAG*" | sort -V | tail -n 1)
+          
+          BUILD_LETTER='a'
+          if [[ -n "$LATEST_TAG_FOR_WEEK" ]]; then
+              echo "Found existing tag for this week: $LATEST_TAG_FOR_WEEK"
+              LAST_LETTER=$(echo "$LATEST_TAG_FOR_WEEK" | sed "s/.*$YEAR_WEEK//")
+              BUILD_LETTER=$(echo "$LAST_LETTER" | tr "0-9a-z" "1-9a-z_")
+              BUILD_LETTER=${BUILD_LETTER:0:1}
+              BUILD_LETTER=$(printf "\\$(printf '%03o' "$(( $(printf '%d' "'$BUILD_LETTER") + 1 ))" ) )
+          fi
+          
+          RELEASE_TAG="$BASE_TAG$BUILD_LETTER"
+
+          if [ "$IS_PRE_RELEASE" = true ]; then
+            RELEASE_TAG="$RELEASE_TAG-pre"
+            echo "Marking release as pre-release."
+          fi
+          
+          echo "Generated Release Tag: $RELEASE_TAG"
+
+          # Set outputs for the next step
+          echo "needs_release=true" >> $GITHUB_OUTPUT
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "mc_version=$MC_VERSION" >> $GITHUB_OUTPUT
+          
+          # Replace the old lock file with the new one for the next run
+          mv "$NEW_VERSIONS_LOG" "$OLD_VERSIONS_LOG"
+          
+      - name: Commit version lock file
+        if: steps.download_mods.outputs.needs_release == 'true'
+        run: |
+          # Commit the updated versions.lock file to keep track of versions
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add versions.lock
+          git commit -m "ci: Update mod versions for release ${{ steps.download_mods.outputs.release_tag }}"
+          git push
+
+      - name: Create Release
+        if: steps.download_mods.outputs.needs_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.download_mods.outputs.release_tag }}
+          name: Modpack ${{ steps.download_mods.outputs.release_tag }}
+          body: |
+            Automated modpack update for Minecraft ${{ steps.download_mods.outputs.mc_version }}.
+            
+            **Changes since last release:**
+            - Check commit history for details on updated mods.
+            
+            **Files:**
+            - Contains all mods and resource packs listed in `modrinth.txt`.
+          # Mark as pre-release in GitHub UI if we used non-release mods
+          prerelease: ${{ contains(steps.download_mods.outputs.release_tag, '-pre') }}
+          files: |
+            mods_temp/*
+            resourcepacks_temp/*

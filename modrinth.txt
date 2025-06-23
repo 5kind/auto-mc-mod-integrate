@@ -1,0 +1,22 @@
+# Format: type/slug
+
+mod/xaeros-minimap
+mod/xaeros-world-map
+mod/modmenu
+mod/appleskin
+mod/malilib
+mod/tweakeroo
+mod/item-scroller
+mod/litematica
+mod/tweakermore
+mod/cherished-worlds
+mod/carpet
+mod/gca
+mod/bhgc
+mod/mcwifipnp
+mod/carpet-tis-addition
+mod/show-durability
+mod/remote-player-waypoints-for-xaeros-map
+mod/chat-heads
+resourcepack/xk-redstone-display
+resourcepack/protect-my-eyes
